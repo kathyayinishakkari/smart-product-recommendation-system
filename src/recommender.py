@@ -1,4 +1,5 @@
 from rapidfuzz import process
+import joblib
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -130,19 +131,148 @@ class RecommendationEngine:
 
         return " | ".join(reasons)
     
-    def recommend(self,query,top_n=10,min_rating=0,max_price=float("inf"),min_discount=0,category=None):
+    def calculate_recommendation_score(self, final_score, best_final_score):
         """
-        Recommend similar products.
+        Calculate recommendation score using the final weighted score.
+        """
+
+        score = (final_score / best_final_score) * 100
+
+        score = min(score, 100)
+
+        if score >= 95:
+            badge = "🥇 Top Pick"
+
+        elif score >= 90:
+            badge = "⭐ Excellent"
+
+        elif score >= 80:
+            badge = "👍 Highly Recommended"
+
+        elif score >= 70:
+            badge = "✅ Good Choice"
+
+        else:
+            badge = "🔍 Worth Considering"
+
+        return round(score, 1), badge
+    
+    def recommend(
+    self,
+    query,
+    top_n=10,
+    min_rating=0,
+    max_price=float("inf"),
+    min_discount=0,
+    category=None
+):
+        """
+        Main recommendation pipeline.
+        """
+
+        similarity_scores = self.get_similarity_scores(
+            query,
+            top_n
+        )
+
+        if similarity_scores is None:
+            return pd.DataFrame()
+
+        scored_products = self.calculate_final_scores(
+            similarity_scores
+        )
+
+        recommendations = self.build_recommendations(
+            scored_products
+        )
+
+        recommendations = self.apply_filters(
+            recommendations,
+            min_rating,
+            max_price,
+            min_discount,
+            category
+        )
+
+        print(
+            f"Found {len(recommendations)} matching recommendations."
+        )
+
+        if recommendations.empty:
+            print(
+                "No products matched your filters."
+            )
+
+        return recommendations
+    
+    def train(self, file_path):
+        """
+        Complete training pipeline.
+        """
+
+        self.load_data(file_path)
+
+        self.create_tfidf_matrix()
+
+        self.compute_similarity()
+
+        self.create_indices()
+
+        print("Recommendation Engine Ready!")
+    
+    def save_model(self, model_dir="../models"):
+        """
+        Save all trained model objects.
+        """
+
+        joblib.dump(self.tfidf, f"{model_dir}/tfidf_vectorizer.pkl")
+
+        joblib.dump(self.tfidf_matrix, f"{model_dir}/tfidf_matrix.pkl")
+
+        joblib.dump(self.cosine_sim, f"{model_dir}/cosine_similarity.pkl")
+
+        joblib.dump(self.indices, f"{model_dir}/product_indices.pkl")
+
+        joblib.dump(self.df, f"{model_dir}/products_dataframe.pkl")
+
+        print("Model saved successfully!")
+
+    def load_model(self, model_dir="../models"):
+        """
+        Load all trained model objects.
+        """
+
+        self.tfidf = joblib.load(f"{model_dir}/tfidf_vectorizer.pkl")
+
+        self.tfidf_matrix = joblib.load(f"{model_dir}/tfidf_matrix.pkl")
+
+        self.cosine_sim = joblib.load(f"{model_dir}/cosine_similarity.pkl")
+
+        self.indices = joblib.load(f"{model_dir}/product_indices.pkl")
+
+        self.df = joblib.load(f"{model_dir}/products_dataframe.pkl")
+
+        self.max_rating = self.df["rating"].max()
+
+        self.max_rating_count = self.df["rating_count"].max()
+
+        print("Model loaded successfully!")
+
+    def get_similarity_scores(self, query, top_n):
+        """
+        Find similar products based on cosine similarity.
         """
 
         product_name = self.search_product(query)
 
         if product_name is None:
-            return pd.DataFrame()
+            return None
 
         idx = self.indices[product_name]
 
-        similarity_scores = list(enumerate(self.cosine_sim[idx]))
+        similarity_scores = list(
+            enumerate(self.cosine_sim[idx])
+        )
 
         similarity_scores = sorted(
             similarity_scores,
@@ -150,15 +280,23 @@ class RecommendationEngine:
             reverse=True
         )
 
-        similarity_scores = similarity_scores[1:top_n + 1]
+        return similarity_scores[1:top_n + 1]
+    
+    def calculate_final_scores(self, similarity_scores):
+        """
+        Calculate weighted scores for every recommendation.
+        """
 
-        recommendations = []
+        scored_products = []
 
         for product_index, similarity in similarity_scores:
 
             product = self.df.iloc[product_index]
-            explanation = self.generate_explanation( similarity,product)
-            rating_score = product["rating"] / self.max_rating
+
+            rating_score = (
+                product["rating"] /
+                self.max_rating
+            )
 
             popularity_score = (
                 product["rating_count"] /
@@ -169,6 +307,44 @@ class RecommendationEngine:
                 0.70 * similarity +
                 0.20 * rating_score +
                 0.10 * popularity_score
+            )
+
+            scored_products.append(
+                (
+                    product_index,
+                    similarity,
+                    final_score
+                )
+            )
+
+        return scored_products
+    
+    def build_recommendations(self, scored_products):
+        """
+        Convert scored products into a dataframe.
+        """
+
+        best_final_score = max(
+            score[2]
+            for score in scored_products
+        )
+
+        recommendations = []
+
+        for product_index, similarity, final_score in scored_products:
+
+            product = self.df.iloc[product_index]
+
+            explanation = self.generate_explanation(
+                similarity,
+                product
+            )
+
+            recommendation_score, badge = (
+                self.calculate_recommendation_score(
+                    final_score,
+                    best_final_score
+                )
             )
 
             recommendations.append({
@@ -187,9 +363,13 @@ class RecommendationEngine:
 
                 "Rating Count": product["rating_count"],
 
-                "Similarity": round(float(similarity), 4),
+                "Similarity": round(float(similarity),4),
 
-                "Final Score": round(float(final_score), 4),
+                "Final Score": round(float(final_score),4),
+
+                "Recommendation Score": recommendation_score,
+
+                "Badge": badge,
 
                 "Why Recommended": explanation,
 
@@ -200,49 +380,47 @@ class RecommendationEngine:
             })
 
         recommendations = pd.DataFrame(recommendations)
+
         recommendations = recommendations.sort_values(
             by="Final Score",
             ascending=False
         ).reset_index(drop=True)
-        # Filter by minimum rating
+
+        return recommendations
+    
+    def apply_filters(
+    self,
+    recommendations,
+    min_rating,
+    max_price,
+    min_discount,
+    category
+):
+        """
+        Apply user-selected filters.
+        """
+
         recommendations = recommendations[
             recommendations["Rating"] >= min_rating
         ]
 
-        # Filter by maximum price
         recommendations = recommendations[
             recommendations["Price"] <= max_price
         ]
 
-        # Filter by minimum discount
         recommendations = recommendations[
             recommendations["Discount (%)"] >= min_discount
         ]
 
-        # Filter by category
         if category is not None:
+
             recommendations = recommendations[
                 recommendations["Category"]
-                .str.contains(category, case=False, na=False)
+                .str.contains(
+                    category,
+                    case=False,
+                    na=False
+                )
             ]
 
-        recommendations = recommendations.reset_index(drop=True)
-        print(f"Found {len(recommendations)} matching recommendations.")
-        if recommendations.empty:
-            print("No products matched your filters.")
-        return recommendations
-    
-    def train(self, file_path):
-        """
-        Complete training pipeline.
-        """
-
-        self.load_data(file_path)
-
-        self.create_tfidf_matrix()
-
-        self.compute_similarity()
-
-        self.create_indices()
-
-        print("Recommendation Engine Ready!")
+        return recommendations.reset_index(drop=True)
